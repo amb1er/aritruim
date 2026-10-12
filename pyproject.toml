@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "funding-arb-bot"
+version = "0.1.0"
+description = "Delta-neutral funding rate arbitrage bot for perpetual futures"
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.9",
+    "certifi>=2024.2.2",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "structlog>=24.0",
+    "aiosqlite>=0.20",
+    "hyperliquid-python-sdk>=0.9",
+    "eth-account>=0.11",      # EIP-712 подпись для Nado
+    "websockets>=12.0",       # WS подписки (funding, orderbook)
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-mock>=3.12",
+    "aioresponses>=0.7",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+funding-arb = "src.main:main"
+funding-farming = "src.farming.main:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]

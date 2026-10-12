@@ -1,0 +1,39 @@
+[Unit]
+Description=Funding Rate Arbitrage Bot
+Documentation=https://github.com/youruser/funding-arb-bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=arb
+Group=arb
+WorkingDirectory=/opt/funding-arb
+ExecStart=/opt/funding-arb/.venv/bin/python -m src.main
+ExecStop=/bin/kill -SIGTERM $MAINPID
+
+# Перезапуск при краше, но не при штатной остановке (код 0)
+Restart=on-failure
+RestartSec=30
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Переменные окружения
+EnvironmentFile=/opt/funding-arb/.env
+
+# Логи идут в journald (просмотр: journalctl -u funding-arb -f)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=funding-arb
+
+# Безопасность
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/funding-arb/data /opt/funding-arb/logs
+
+# Дать время на graceful shutdown (закрытие позиций)
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
