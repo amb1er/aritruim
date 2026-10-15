@@ -6,6 +6,7 @@ import pytest
 from aioresponses import aioresponses
 
 from src.adapters.nado import NadoAdapter
+from src.config import Settings
 
 PRODUCTS = [
     {
@@ -108,3 +109,21 @@ async def test_gateway_failure_is_not_an_empty_success(adapter):
         )
         with pytest.raises(ValueError, match="Nado query failed"):
             await adapter._query("contracts")
+
+
+def test_instance_index_selects_credentials_and_name():
+    settings = Settings(
+        _env_file=None,
+        nado_wallets="wallet-1, wallet-2",
+        nado_private_keys="key-1, key-2",
+        nado_proxies="http://proxy-1:8080, http://proxy-2:8080",
+    )
+    adapter = NadoAdapter(
+        settings,
+        instance_index=1,
+        transport_url=settings.nado_proxies[1],
+    )
+    assert adapter.name == "nado_account_1"
+    assert adapter._wallet_address == "wallet-2"
+    assert adapter._private_key == "key-2"
+    assert adapter._transport_url == "http://proxy-2:8080"

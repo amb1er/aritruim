@@ -17,6 +17,7 @@ dependencies = [
     "hyperliquid-python-sdk>=0.9",
     "eth-account>=0.11",      # EIP-712 подпись для Nado
     "websockets>=12.0",       # WS подписки (funding, orderbook)
+    "polymarket-client>=0.13,<0.14",
 ]
 
 [project.optional-dependencies]

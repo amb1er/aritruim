@@ -30,9 +30,7 @@ def load_catalog(path=CATALOG):
 
 
 class NormalizedAdapter:
-    """Wrap an already connected adapter; canonical quantities are paper-only."""
-
-    supports_live = False
+    """Wrap an adapter and translate canonical symbols and quantities."""
 
     def __init__(self, adapter, symbols, catalog):
         self._adapter = adapter
@@ -40,8 +38,14 @@ class NormalizedAdapter:
         self._mapping = {}
         self._canonical = {}
         self._ambiguous = set()
+        name_parts = adapter.name.rsplit("_account_", 1)
+        catalog_exchange = (
+            name_parts[0]
+            if len(name_parts) == 2 and name_parts[1].isdigit()
+            else adapter.name
+        )
         for native in symbols:
-            asset, factor = catalog.get((adapter.name, native), (native, Decimal("1")))
+            asset, factor = catalog.get((catalog_exchange, native), (native, Decimal("1")))
             self._mapping[native] = (asset, factor)
             if asset in self._canonical:
                 self._ambiguous.add(asset)
@@ -52,6 +56,10 @@ class NormalizedAdapter:
 
     def __getattr__(self, name):
         return getattr(self._adapter, name)
+
+    @property
+    def supports_live(self):
+        return getattr(self._adapter, "supports_live", True)
 
     def canonical_symbol(self, symbol):
         return self._mapping.get(symbol, (symbol, Decimal("1")))[0]
@@ -117,7 +125,33 @@ class NormalizedAdapter:
         return replace(await self._adapter.get_fee_rate(native), symbol=symbol)
 
     async def place_order(self, order):
-        raise NotImplementedError("Normalized instruments support paper execution only")
+        native, factor = self._resolve(order.symbol)
+        native_order = replace(
+            order,
+            exchange=self._adapter.name,
+            symbol=native,
+            quantity=order.quantity / factor if order.quantity is not None else None,
+        )
+        result = await self._adapter.place_order(native_order)
+        return replace(
+            result,
+            exchange=self.name,
+            symbol=order.symbol,
+            filled_size=result.filled_size * factor,
+            avg_price=result.avg_price / factor if result.avg_price else result.avg_price,
+        )
+
+    async def cancel_order(self, symbol, order_id):
+        native, _ = self._resolve(symbol)
+        return await self._adapter.cancel_order(native, order_id)
 
     async def close_position(self, symbol, side):
-        raise NotImplementedError("Normalized instruments support paper execution only")
+        native, factor = self._resolve(symbol)
+        result = await self._adapter.close_position(native, side)
+        return replace(
+            result,
+            exchange=self.name,
+            symbol=symbol,
+            filled_size=result.filled_size * factor,
+            avg_price=result.avg_price / factor if result.avg_price else result.avg_price,
+        )

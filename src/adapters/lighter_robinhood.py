@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import aiohttp
+import structlog
 
 from src.adapters.base import ExchangeAdapter
 from src.models import (
@@ -30,8 +31,29 @@ class LighterRobinhoodAdapter(ExchangeAdapter):
     funding_model = "hourly_history"
     FUNDING_INTERVAL_HOURS = 8  # /funding-rates is normalized to an 8h equivalent.
 
-    def __init__(self, settings) -> None:
+    def __init__(
+        self,
+        settings,
+        instance_index: int | None = None,
+        transport_url: str | None = None,
+    ) -> None:
         self._settings = settings
+        self._instance_index = instance_index
+        self._adapter_name = (
+            "lighter_robinhood"
+            if instance_index is None
+            else f"lighter_robinhood_account_{instance_index}"
+        )
+        self._transport_url = transport_url
+        if instance_index is not None:
+            accounts = settings.resolved_lighter_robinhood_accounts()
+            if accounts and instance_index >= len(accounts):
+                raise IndexError(
+                    f"Lighter Robinhood account index {instance_index} is not configured"
+                )
+            if accounts:
+                self._transport_url = transport_url or accounts[instance_index].transport_url
+        self._log = structlog.get_logger(__name__).bind(instance_index=instance_index)
         self._base_url = settings.lighter_robinhood_rest_url.rstrip("/")
         self._session: aiohttp.ClientSession | None = None
         self._markets: dict[str, dict] = {}
@@ -39,14 +61,31 @@ class LighterRobinhoodAdapter(ExchangeAdapter):
 
     @property
     def name(self) -> str:
-        return "lighter_robinhood"
+        return self._adapter_name
 
     async def connect(self) -> None:
-        self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=10),
-            connector=aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver()),
-        )
-        await self._load_markets(force=True)
+        try:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10),
+                connector=aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver()),
+                proxy=self._transport_url,
+            )
+            await self._load_markets(force=True)
+            self._log.info(
+                "lighter_robinhood.connected",
+                exchange=self.name,
+                transport_configured=bool(self._transport_url),
+            )
+        except Exception as exc:
+            if self._session is not None:
+                await self._session.close()
+                self._session = None
+            self._log.error(
+                "lighter_robinhood.connect_failed",
+                exchange=self.name,
+                error=str(exc),
+            )
+            raise
 
     async def disconnect(self) -> None:
         if self._session:

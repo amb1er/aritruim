@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import aiohttp
+import structlog
 
 from src.adapters.base import ExchangeAdapter
 from src.models import Balance, FeeRate, FundingRate, Orderbook, OrderbookLevel, OrderResult
@@ -25,6 +26,7 @@ LIVE_UNAVAILABLE = (
     "Nado live trading is disabled: signed orders, confirmed fills and "
     "funding settlement are not implemented"
 )
+log = structlog.get_logger(__name__)
 
 
 class NadoAdapter(ExchangeAdapter):
@@ -41,8 +43,20 @@ class NadoAdapter(ExchangeAdapter):
                         Decimal(state["cumulative_funding_short_x18"]) / X18)
         raise ValueError(f"No Nado funding indices for {symbol}")
 
-    def __init__(self, settings):
+    def __init__(
+        self,
+        settings,
+        instance_index: int = 0,
+        transport_url: str | None = None,
+    ):
         self._settings = settings
+        self._instance_index = instance_index
+        self._transport_url = transport_url
+        self._adapter_name = f"nado_account_{instance_index}"
+        account = settings.resolved_nado_accounts()[instance_index]
+        self._wallet_address = account.address
+        self._private_key = account.credential
+        self._log = log.bind(instance_index=instance_index)
         self._session = None
         self._rest_url = settings.nado_rest_url.rstrip("/")
         self._products = {}
@@ -52,13 +66,27 @@ class NadoAdapter(ExchangeAdapter):
 
     @property
     def name(self):
-        return "nado"
+        return self._adapter_name
 
     async def connect(self):
-        self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=10),
-            connector=aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver()),
-        )
+        try:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10),
+                connector=aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver()),
+                proxy=self._transport_url,
+            )
+        except Exception as exc:
+            if self._session:
+                await self._session.close()
+                self._session = None
+            self._log.error(
+                "nado.connection_failed",
+                exchange=self.name,
+                transport_configured=bool(self._transport_url),
+                error=str(exc),
+            )
+            raise ConnectionError(f"Could not connect {self.name}") from exc
+        self._log.info("nado.connected", exchange=self.name, url=self._rest_url)
 
     async def disconnect(self):
         if self._ws_task:
@@ -172,7 +200,7 @@ class NadoAdapter(ExchangeAdapter):
         )
 
     async def get_balance(self):
-        if not self._settings.nado_wallet_address:
+        if not self._wallet_address:
             return Balance(self.name, Decimal("0"), Decimal("0"))
         raise NotImplementedError(LIVE_UNAVAILABLE)
 

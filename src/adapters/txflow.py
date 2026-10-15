@@ -8,11 +8,19 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import aiohttp
+import structlog
 
 from src.adapters.base import ExchangeAdapter
 from src.models import (
-    Balance, FeeRate, FundingRate, Orderbook, OrderbookLevel, OrderRequest,
-    OrderResult, Position, utc_now,
+    Balance,
+    FeeRate,
+    FundingRate,
+    Orderbook,
+    OrderbookLevel,
+    OrderRequest,
+    OrderResult,
+    Position,
+    utc_now,
 )
 
 
@@ -20,8 +28,30 @@ class TxFlowAdapter(ExchangeAdapter):
     supports_live = False
     funding_model = "scheduled_estimate"
 
-    def __init__(self, settings) -> None:
+    def __init__(
+        self,
+        settings,
+        instance_index: int | None = None,
+        transport_url: str | None = None,
+    ) -> None:
         self._settings = settings
+        self._instance_index = instance_index
+        self._adapter_name = (
+            "txflow" if instance_index is None else f"txflow_account_{instance_index}"
+        )
+        self._transport_url = transport_url
+        self._address = ""
+        self._credential = ""
+        if instance_index is not None:
+            accounts = settings.resolved_txflow_accounts()
+            if accounts and instance_index >= len(accounts):
+                raise IndexError(f"TxFlow account index {instance_index} is not configured")
+            if accounts:
+                account = accounts[instance_index]
+                self._address = account.address
+                self._credential = account.credential
+                self._transport_url = transport_url or account.transport_url
+        self._log = structlog.get_logger(__name__).bind(instance_index=instance_index)
         self._rest = settings.txflow_rest_url.rstrip("/")
         self._ws = settings.txflow_ws_url
         self._session: aiohttp.ClientSession | None = None
@@ -30,20 +60,32 @@ class TxFlowAdapter(ExchangeAdapter):
 
     @property
     def name(self) -> str:
-        return "txflow"
+        return self._adapter_name
 
     async def connect(self) -> None:
-        self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=20),
-            connector=aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver()),
-            headers={
-                "User-Agent": "funding-arb-bot/0.1",
-                "Origin": "https://app.txflow.com",
-                "Referer": "https://app.txflow.com/",
-                "x-api-version": self._settings.txflow_api_version,
-            },
-        )
-        await self._load_markets()
+        try:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=20),
+                connector=aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver()),
+                headers={
+                    "User-Agent": "funding-arb-bot/0.1",
+                    "Origin": "https://app.txflow.com",
+                    "Referer": "https://app.txflow.com/",
+                    "x-api-version": self._settings.txflow_api_version,
+                },
+                proxy=self._transport_url,
+            )
+            await self._load_markets()
+        except Exception as exc:
+            if self._session is not None:
+                await self._session.close()
+                self._session = None
+            self._log.error(
+                "txflow.connect_failed",
+                transport_configured=bool(self._transport_url),
+                error=str(exc),
+            )
+            raise
 
     async def disconnect(self) -> None:
         if self._session:
@@ -71,7 +113,11 @@ class TxFlowAdapter(ExchangeAdapter):
     async def _snapshot(self, subscription: dict) -> dict:
         if self._session is None:
             raise RuntimeError("TxFlow adapter is not connected")
-        async with self._session.ws_connect(self._ws, origin="https://app.txflow.com") as ws:
+        async with self._session.ws_connect(
+            self._ws,
+            origin="https://app.txflow.com",
+            proxy=self._transport_url,
+        ) as ws:
             await ws.send_json({
                 "method": "subscribe",
                 "type": subscription["type"],

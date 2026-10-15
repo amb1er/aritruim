@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from src.adapters.hyperliquid import HyperliquidAdapter
+from src.config import Settings
 
 # Мок ответ от /info?type=metaAndAssetCtxs
 MOCK_META_AND_CTXS = [
@@ -48,6 +49,7 @@ async def test_fee_defaults_match_base_tier(adapter):
 @pytest.mark.asyncio
 async def test_fee_parser_uses_documented_user_fields(adapter, settings):
     settings.hyperliquid_wallet_address = "0x" + "0" * 40
+    adapter = HyperliquidAdapter(settings)
     with patch.object(
         adapter,
         "_post",
@@ -72,7 +74,7 @@ async def test_get_funding_rates_parses_correctly(adapter, settings):
 
     assert len(rates) == 3
     btc = next(r for r in rates if r.symbol == "BTC")
-    assert btc.exchange == "hyperliquid"
+    assert btc.exchange == "hyperliquid_account_0"
     assert btc.rate == Decimal("0.0000125")
     assert btc.interval_hours == 1
 
@@ -108,7 +110,7 @@ async def test_get_orderbook_parses_levels(adapter):
     assert len(ob.asks) == 2
     assert ob.bids[0].price == Decimal("99990")
     assert ob.asks[0].price == Decimal("100010")
-    assert ob.exchange == "hyperliquid"
+    assert ob.exchange == "hyperliquid_account_0"
     assert ob.symbol == "BTC"
 
 
@@ -129,3 +131,21 @@ async def test_annualized_rate(adapter):
     btc = next(r for r in rates if r.symbol == "BTC")
     # 0.0000125 per hour × 8760 hours = 0.1095 = ~10.95% годовых
     assert abs(btc.annualized - Decimal("0.1095")) < Decimal("0.001")
+
+
+def test_instance_index_selects_credentials_and_name():
+    settings = Settings(
+        _env_file=None,
+        hyperliquid_wallets="wallet-1, wallet-2",
+        hyperliquid_private_keys="key-1, key-2",
+        hyperliquid_proxies="http://proxy-1:8080, http://proxy-2:8080",
+    )
+    adapter = HyperliquidAdapter(
+        settings,
+        instance_index=1,
+        transport_url=settings.hyperliquid_proxies[1],
+    )
+    assert adapter.name == "hyperliquid_account_1"
+    assert adapter._wallet_address == "wallet-2"
+    assert adapter._private_key == "key-2"
+    assert adapter._transport_url == "http://proxy-2:8080"

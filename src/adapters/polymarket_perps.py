@@ -5,54 +5,137 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
+from typing import Any
 
 import aiohttp
+import structlog
 
 from src.adapters.base import ExchangeAdapter
 from src.models import (
     Balance,
+    BotMode,
     FeeRate,
     FundingRate,
     Orderbook,
     OrderbookLevel,
     OrderRequest,
     OrderResult,
+    OrderSide,
     Position,
     utc_now,
 )
 
 
 class PolymarketPerpsAdapter(ExchangeAdapter):
-    """Polymarket Perps public data and paper execution; live writes are disabled."""
+    """Polymarket Perps market data and official-SDK live execution."""
 
-    supports_live = False
     funding_model = "period_history"
 
-    def __init__(self, settings) -> None:
+    def __init__(
+        self,
+        settings,
+        instance_index: int | None = None,
+        transport_url: str | None = None,
+    ) -> None:
         self._settings = settings
+        self._instance_index = instance_index
+        self._adapter_name = (
+            "polymarket_perps"
+            if instance_index is None
+            else f"polymarket_perps_account_{instance_index}"
+        )
+        self._transport_url = transport_url
+        self._address = ""
+        self._credential = ""
+        if instance_index is not None:
+            accounts = settings.resolved_polymarket_perps_accounts()
+            if accounts and instance_index >= len(accounts):
+                raise IndexError(
+                    f"Polymarket Perps account index {instance_index} is not configured"
+                )
+            if accounts:
+                account = accounts[instance_index]
+                self._address = account.address
+                self._credential = account.credential
+                self._transport_url = transport_url or account.transport_url
+        self._log = structlog.get_logger(__name__).bind(instance_index=instance_index)
         self._base_url = settings.polymarket_perps_rest_url.rstrip("/")
         self._session: aiohttp.ClientSession | None = None
         self._instruments: dict[str, dict] = {}
         self._fees: dict[str, dict] = {}
         self._market_lock = asyncio.Lock()
+        self._secure_client: Any | None = None
+        self._perps_session: Any | None = None
+
+    @property
+    def supports_live(self) -> bool:
+        return self._perps_session is not None
 
     @property
     def name(self) -> str:
-        return "polymarket_perps"
+        return self._adapter_name
 
     async def connect(self) -> None:
-        self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=15),
-            connector=aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver()),
-            headers={"User-Agent": "funding-arb-bot/0.1"},
-        )
-        await self._load_metadata(force=True)
+        try:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=15),
+                connector=aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver()),
+                headers={"User-Agent": "funding-arb-bot/0.1"},
+                proxy=self._transport_url,
+            )
+            await self._load_metadata(force=True)
+            if (
+                self._settings.bot_mode == BotMode.LIVE
+                or self._settings.farming_mode == BotMode.LIVE
+            ) and self._credential:
+                await self._connect_live()
+        except Exception as exc:
+            if self._session is not None:
+                await self._session.close()
+                self._session = None
+            self._log.error(
+                "polymarket_perps.connect_failed",
+                transport_configured=bool(self._transport_url),
+                error=str(exc),
+            )
+            raise
 
     async def disconnect(self) -> None:
+        if self._perps_session is not None:
+            await self._perps_session.close()
+            self._perps_session = None
+        if self._secure_client is not None:
+            await self._secure_client.close()
+            self._secure_client = None
         if self._session:
             await self._session.close()
             self._session = None
+
+    async def _connect_live(self) -> None:
+        if self._transport_url:
+            raise RuntimeError(
+                "Polymarket official SDK does not expose per-client transport proxy support"
+            )
+        try:
+            from polymarket import AsyncSecureClient
+        except ImportError as exc:
+            raise RuntimeError(
+                "Install polymarket-client>=0.13,<0.14 for Polymarket Perps live trading"
+            ) from exc
+        self._secure_client = await AsyncSecureClient.create(
+            private_key=self._credential,
+            wallet=self._address or None,
+        )
+        try:
+            self._perps_session = await self._secure_client.open_perps_session(
+                label=f"funding-arb-{self._instance_index or 0}"
+            )
+        except BaseException:
+            await self._secure_client.close()
+            self._secure_client = None
+            raise
+        self._log.info("polymarket_perps.live_connected")
 
     async def _get(self, path: str, params: dict | None = None):
         if self._session is None:
@@ -211,19 +294,128 @@ class PolymarketPerpsAdapter(ExchangeAdapter):
         )
 
     async def get_balance(self) -> Balance:
-        return Balance(self.name, Decimal("0"), Decimal("0"))
+        if self._perps_session is None:
+            return Balance(self.name, Decimal("0"), Decimal("0"))
+        portfolio = await self._perps_session.fetch_portfolio()
+        return Balance(
+            self.name,
+            Decimal(portfolio.margin.total_account_value),
+            Decimal(portfolio.withdrawable),
+            portfolio.timestamp,
+        )
 
     async def get_positions(self) -> list[Position]:
-        return []
+        if self._perps_session is None:
+            return []
+        portfolio = await self._perps_session.fetch_portfolio()
+        by_id = {int(row["instrument_id"]): symbol for symbol, row in self._instruments.items()}
+        return [
+            Position(
+                exchange=self.name,
+                symbol=by_id.get(int(item.instrument_id), item.symbol).upper(),
+                side=OrderSide.LONG if item.size > 0 else OrderSide.SHORT,
+                size=abs(Decimal(item.size)),
+                entry_price=Decimal(item.entry_price),
+                unrealized_pnl=Decimal(item.unrealized_pnl),
+                timestamp=portfolio.timestamp,
+            )
+            for item in portfolio.positions
+            if item.size != 0
+        ]
 
     async def place_order(self, order: OrderRequest) -> OrderResult:
-        raise NotImplementedError("Polymarket Perps live trading is not enabled")
+        if self._perps_session is None:
+            return self._order_error(order, "Polymarket Perps live session is not connected")
+        try:
+            instrument = await self._instrument(order.symbol)
+            mark = await self.get_mark_price(order.symbol)
+            quantity = order.quantity or order.notional_usd / mark
+            step = Decimal(1).scaleb(-int(instrument["quantity_decimals"]))
+            quantity = quantity.quantize(step, rounding=ROUND_DOWN)
+            if quantity <= 0:
+                return self._order_error(order, "Order quantity rounds to zero")
+            placement = await self._perps_session.place_order(
+                instrument_id=int(instrument["instrument_id"]),
+                side="BUY" if order.side == OrderSide.LONG else "SELL",
+                quantity=quantity,
+                time_in_force="ioc",
+                reduce_only=order.is_reduce_only,
+                client_order_id=order.client_id or None,
+            )
+            placed = placement.order
+            filled = Decimal(placed.filled_quantity)
+            avg_price = Decimal(placed.price) if filled > 0 else Decimal("0")
+            fee = await self.get_fee_rate(order.symbol)
+            success = filled > 0
+            return OrderResult(
+                exchange=self.name,
+                symbol=order.symbol,
+                order_id=str(placed.id),
+                side=order.side,
+                filled_size=filled,
+                avg_price=avg_price,
+                fee_paid=filled * avg_price * fee.taker,
+                success=success,
+                error="" if success else f"Polymarket order status: {placed.status}",
+            )
+        except Exception as exc:
+            self._log.error("polymarket_perps.order_failed", symbol=order.symbol, error=str(exc))
+            return self._order_error(order, str(exc), uncertain=True)
 
     async def cancel_order(self, symbol: str, order_id: str) -> bool:
-        raise NotImplementedError("Polymarket Perps live trading is not enabled")
+        if self._perps_session is None:
+            return False
+        try:
+            result = await self._perps_session.cancel_order(order_id=int(order_id))
+            return result.status == "ok"
+        except Exception as exc:
+            self._log.error(
+                "polymarket_perps.cancel_failed",
+                symbol=symbol,
+                order_id=order_id,
+                error=str(exc),
+            )
+            return False
 
     async def close_position(self, symbol: str, side: str) -> OrderResult:
-        raise NotImplementedError("Polymarket Perps live trading is not enabled")
+        requested_side = OrderSide(side)
+        position = next(
+            (
+                item
+                for item in await self.get_positions()
+                if item.symbol == symbol.upper() and item.side == requested_side
+            ),
+            None,
+        )
+        close_side = OrderSide.SHORT if requested_side == OrderSide.LONG else OrderSide.LONG
+        request = OrderRequest(
+            exchange=self.name,
+            symbol=symbol,
+            side=close_side,
+            notional_usd=Decimal("0"),
+            leverage=Decimal("1"),
+            is_reduce_only=True,
+            quantity=position.size if position else Decimal("0"),
+        )
+        if position is None:
+            return self._order_error(request, "No matching Polymarket Perps position")
+        return await self.place_order(request)
+
+    def _order_error(
+        self, order: OrderRequest, error: str, *, uncertain: bool = False
+    ) -> OrderResult:
+        return OrderResult(
+            exchange=self.name,
+            symbol=order.symbol,
+            order_id="",
+            side=order.side,
+            filled_size=Decimal("0"),
+            avg_price=Decimal("0"),
+            fee_paid=Decimal("0"),
+            success=False,
+            error=error,
+            uncertain=uncertain,
+        )
 
     async def subscribe_funding(self, callback: Callable[[FundingRate], None]) -> None:
         while True:

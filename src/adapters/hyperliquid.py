@@ -54,9 +54,20 @@ _WS_PING_TIMEOUT_SEC = 20  # таймаут ожидания pong после pin
 
 class HyperliquidAdapter(ExchangeAdapter):
     funding_model = "hourly_history"
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        instance_index: int = 0,
+        transport_url: str | None = None,
+    ) -> None:
         self._settings = settings
-        self._adapter_name = "hyperliquid"
+        self._instance_index = instance_index
+        self._transport_url = transport_url
+        self._adapter_name = f"hyperliquid_account_{instance_index}"
+        account = settings.resolved_hyperliquid_accounts()[instance_index]
+        self._wallet_address = account.address
+        self._private_key = account.credential
+        self._log = log.bind(instance_index=instance_index)
         self._dex = ""
         self._session: aiohttp.ClientSession | None = None
         self._rest_url = settings.hyperliquid_rest_url
@@ -93,12 +104,25 @@ class HyperliquidAdapter(ExchangeAdapter):
     # ── Жизненный цикл ────────────────────────────────────────────────────────
 
     async def connect(self) -> None:
-        self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=10),
-            headers={"Content-Type": "application/json"},
-            connector=aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver()),
-        )
-        log.info("hyperliquid.connected", url=self._rest_url)
+        try:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10),
+                headers={"Content-Type": "application/json"},
+                connector=aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver()),
+                proxy=self._transport_url,
+            )
+        except Exception as exc:
+            if self._session:
+                await self._session.close()
+                self._session = None
+            self._log.error(
+                "hyperliquid.connection_failed",
+                exchange=self.name,
+                transport_configured=bool(self._transport_url),
+                error=str(exc),
+            )
+            raise ConnectionError(f"Could not connect {self.name}") from exc
+        self._log.info("hyperliquid.connected", exchange=self.name, url=self._rest_url)
 
     async def disconnect(self) -> None:
         if self._ws_task:
@@ -107,7 +131,7 @@ class HyperliquidAdapter(ExchangeAdapter):
         if self._session:
             await self._session.close()
             self._session = None
-        log.info("hyperliquid.disconnected")
+        self._log.info("hyperliquid.disconnected")
 
     def _get_exchange(self):
         """
@@ -126,12 +150,16 @@ class HyperliquidAdapter(ExchangeAdapter):
                 else constants.MAINNET_API_URL
             )
             self._exchange = Exchange(
-                wallet=Account.from_key(self._settings.hyperliquid_private_key),
+                wallet=Account.from_key(self._private_key),
                 base_url=base_url,
-                account_address=self._settings.hyperliquid_wallet_address or None,
+                account_address=self._wallet_address or None,
                 perp_dexs=[self._dex] if self._dex else None,
                 timeout=10,
             )
+            if self._transport_url:
+                self._exchange.session.proxies.update(
+                    {"http": self._transport_url, "https": self._transport_url}
+                )
         return self._exchange
 
     # ── Внутренний HTTP запрос ────────────────────────────────────────────────
@@ -187,7 +215,7 @@ class HyperliquidAdapter(ExchangeAdapter):
                     timestamp=now,
                 )
             )
-        log.debug("hyperliquid.funding_rates_fetched", count=len(result))
+        self._log.debug("hyperliquid.funding_rates_fetched", count=len(result))
         return result
 
     async def get_orderbook(self, symbol: str, depth: int = 20) -> Orderbook:
@@ -228,12 +256,12 @@ class HyperliquidAdapter(ExchangeAdapter):
         """
         Docs: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint#user-fees
         """
-        if not self._settings.hyperliquid_wallet_address:
+        if not self._wallet_address:
             return FeeRate(self.name, symbol, Decimal("0.00015"), Decimal("0.00045"))
         data = await self._post(
             {
                 "type": "userFees",
-                "user": self._settings.hyperliquid_wallet_address,
+                "user": self._wallet_address,
             }
         )
         return FeeRate(
@@ -281,12 +309,12 @@ class HyperliquidAdapter(ExchangeAdapter):
     # ── Аккаунт ───────────────────────────────────────────────────────────────
 
     async def get_balance(self) -> Balance:
-        if not self._settings.hyperliquid_wallet_address:
+        if not self._wallet_address:
             return Balance(self.name, Decimal("0"), Decimal("0"))
         data = await self._post(
             {
                 "type": "clearinghouseState",
-                "user": self._settings.hyperliquid_wallet_address,
+                "user": self._wallet_address,
                 "dex": self._dex,
             }
         )
@@ -296,12 +324,12 @@ class HyperliquidAdapter(ExchangeAdapter):
         return Balance(self.name, total, available)
 
     async def get_positions(self) -> list[Position]:
-        if not self._settings.hyperliquid_wallet_address:
+        if not self._wallet_address:
             return []
         data = await self._post(
             {
                 "type": "clearinghouseState",
-                "user": self._settings.hyperliquid_wallet_address,
+                "user": self._wallet_address,
                 "dex": self._dex,
             }
         )
@@ -392,7 +420,9 @@ class HyperliquidAdapter(ExchangeAdapter):
             )
             return result.get("status") == "ok"
         except Exception as e:
-            log.error("hyperliquid.cancel_failed", symbol=symbol, order_id=order_id, error=str(e))
+            self._log.error(
+                "hyperliquid.cancel_failed", symbol=symbol, order_id=order_id, error=str(e)
+            )
             return False
 
     async def close_position(self, symbol: str, side: str) -> OrderResult:
@@ -438,7 +468,7 @@ class HyperliquidAdapter(ExchangeAdapter):
         Docs: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket
         """
         if self._ws_task and not self._ws_task.done():
-            log.warning("hyperliquid.ws_already_subscribed")
+            self._log.warning("hyperliquid.ws_already_subscribed")
             return
         self._ws_task = asyncio.create_task(self._ws_funding_loop(callback), name="hl_ws_funding")
 
@@ -449,6 +479,7 @@ class HyperliquidAdapter(ExchangeAdapter):
                     self._ws_url,
                     open_timeout=_WS_OPEN_TIMEOUT_SEC,
                     ping_timeout=_WS_PING_TIMEOUT_SEC,
+                    proxy=self._transport_url,
                 ) as ws:
                     symbols = await self.get_symbols()
                     for symbol in symbols:
@@ -463,7 +494,7 @@ class HyperliquidAdapter(ExchangeAdapter):
                                 }
                             )
                         )
-                    log.info(
+                    self._log.info(
                         "hyperliquid.ws_funding_subscribed",
                         exchange=self.name,
                         symbols=len(symbols),
@@ -474,9 +505,9 @@ class HyperliquidAdapter(ExchangeAdapter):
                             msg = json.loads(raw)
                             await self._handle_ws_funding_msg(msg, callback)
                         except Exception as e:
-                            log.warning("hyperliquid.ws_parse_error", error=str(e))
+                            self._log.warning("hyperliquid.ws_parse_error", error=str(e))
             except Exception as e:
-                log.warning("hyperliquid.ws_disconnected", error=str(e))
+                self._log.warning("hyperliquid.ws_disconnected", error=str(e))
                 await asyncio.sleep(5)  # reconnect delay
 
     async def _handle_ws_funding_msg(
@@ -530,8 +561,9 @@ class HyperliquidAdapter(ExchangeAdapter):
         if total_sz <= 0 or avg_px <= 0 or not oid:
             return self._error_result(order, "Unknown fill details")
 
-        # Use default taker fee; real fee is available via get_fee_rate() if wallet is set
-        fee_rate = Decimal("0.00045")
+        fee_rate = (
+            self._settings.entropy_taker_fee if self._dex else Decimal("0.00045")
+        )
         fee_paid = total_sz * avg_px * fee_rate
 
         return OrderResult(

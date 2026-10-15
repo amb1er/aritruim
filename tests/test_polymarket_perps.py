@@ -1,11 +1,13 @@
 import re
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from aioresponses import aioresponses
 
 from src.adapters.polymarket_perps import PolymarketPerpsAdapter
+from src.models import OrderRequest, OrderSide
 
 INSTRUMENTS = [
     {
@@ -14,6 +16,7 @@ INSTRUMENTS = [
         "category": "crypto",
         "symbol": "BTC-USD",
         "base_asset": "BTC",
+        "quantity_decimals": 5,
         "funding_interval": "1h",
         "ui_live_time": 0,
     },
@@ -23,6 +26,7 @@ INSTRUMENTS = [
         "category": "equity",
         "symbol": "GOOG-USD",
         "base_asset": "GOOGL",
+        "quantity_decimals": 4,
         "funding_interval": "1h",
         "ui_live_time": 0,
     },
@@ -126,7 +130,7 @@ async def test_orderbook_maps_supported_depth(adapter):
 
 
 @pytest.mark.asyncio
-async def test_funding_history_and_live_writes_disabled(adapter):
+async def test_funding_history_and_disconnected_live_writes_fail_closed(adapter):
     with aioresponses() as http:
         http.get(
             re.compile(re.escape(adapter._base_url + "/v1/info/funding") + r"\?.*"),
@@ -137,5 +141,40 @@ async def test_funding_history_and_live_writes_disabled(adapter):
         )
         history = await adapter.get_funding_history("BTC", lookback_hours=2)
     assert history[0].rate == Decimal("0.00001")
-    with pytest.raises(NotImplementedError):
-        await adapter.cancel_order("BTC", "1")
+    assert await adapter.cancel_order("BTC", "1") is False
+
+
+@pytest.mark.asyncio
+async def test_live_ioc_order_uses_confirmed_fill(adapter):
+    adapter._perps_session = AsyncMock()
+    adapter._perps_session.place_order.return_value = SimpleNamespace(
+        order=SimpleNamespace(
+            id=123,
+            filled_quantity=Decimal("0.001"),
+            price=Decimal("65000"),
+            status="filled",
+        )
+    )
+    with patch.object(adapter, "get_mark_price", new=AsyncMock(return_value=Decimal("65000"))):
+        result = await adapter.place_order(
+            OrderRequest(
+                exchange=adapter.name,
+                symbol="BTC",
+                side=OrderSide.LONG,
+                notional_usd=Decimal("65"),
+                leverage=Decimal("1"),
+                client_id="a" * 32,
+            )
+        )
+    assert result.success is True
+    assert result.order_id == "123"
+    assert result.filled_size == Decimal("0.001")
+    adapter._perps_session.place_order.assert_awaited_once_with(
+        instrument_id=6,
+        side="BUY",
+        quantity=Decimal("0.00100"),
+        time_in_force="ioc",
+        reduce_only=False,
+        client_order_id="a" * 32,
+    )
+    adapter._perps_session = None
