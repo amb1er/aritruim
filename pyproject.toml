@@ -8,16 +8,17 @@ version = "0.1.0"
 description = "Delta-neutral funding rate arbitrage bot for perpetual futures"
 requires-python = ">=3.11"
 dependencies = [
-    "aiohttp>=3.9",
+    "aiohttp>=3.13",
     "certifi>=2024.2.2",
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
     "structlog>=24.0",
     "aiosqlite>=0.20",
     "hyperliquid-python-sdk>=0.9",
-    "eth-account>=0.11",      # EIP-712 подпись для Nado
+    "eth-account>=0.13.4",    # EIP-712 signature for Nado and Lighter SDK
     "websockets>=12.0",       # WS подписки (funding, orderbook)
     "polymarket-client>=0.13,<0.14",
+    "lighter-sdk==1.1.6",
 ]
 
 [project.optional-dependencies]

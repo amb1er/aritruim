@@ -24,6 +24,8 @@ class PerformanceStats:
     total_return: Decimal = Decimal("0")
     last_closed_at: datetime | None = None
     worst_return: Decimal = Decimal("0")
+    gross_profit: Decimal = Decimal("0")
+    gross_loss: Decimal = Decimal("0")
 
     def add(self, net_pnl: Decimal, notional_usd: Decimal, closed_at: datetime) -> None:
         if notional_usd <= 0:
@@ -33,12 +35,26 @@ class PerformanceStats:
         self.wins += int(net_pnl > 0)
         self.total_return += trade_return
         self.worst_return = min(self.worst_return, trade_return)
+        if trade_return > 0:
+            self.gross_profit += trade_return
+        elif trade_return < 0:
+            self.gross_loss += -trade_return
         if self.last_closed_at is None or closed_at > self.last_closed_at:
             self.last_closed_at = closed_at
 
     @property
     def win_rate(self) -> Decimal:
         return Decimal(self.wins) / Decimal(self.trades) if self.trades else Decimal("0")
+
+    @property
+    def average_return(self) -> Decimal:
+        return self.total_return / Decimal(self.trades) if self.trades else Decimal("0")
+
+    @property
+    def profit_factor(self) -> Decimal:
+        if self.gross_loss == 0:
+            return Decimal("Infinity") if self.gross_profit > 0 else Decimal("0")
+        return self.gross_profit / self.gross_loss
 
 
 @dataclass(frozen=True)
@@ -101,9 +117,8 @@ class PerformanceGuard:
             self._active(route, now)
             and route.trades >= self.min_route_trades
             and route.total_return < 0
-            and route.win_rate < Decimal("0.55")
         ):
-            return PerformanceDecision(False, "negative_route_history", combo, route)
+            return PerformanceDecision(False, "negative_route_expectancy", combo, route)
         return PerformanceDecision(True, "insufficient_or_positive_history", combo, route)
 
     def _active(self, stats: PerformanceStats, now: datetime) -> bool:

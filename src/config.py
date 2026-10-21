@@ -4,7 +4,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Annotated
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from src.models import BotMode, LogFormat, ShutdownMode, TelegramLevel
@@ -64,6 +64,8 @@ class Settings(BaseSettings):
     lighter_robinhood_accounts: Annotated[list[AccountConfig], NoDecode] = Field(
         default_factory=list
     )
+    lighter_robinhood_account_indices: Annotated[list[int], NoDecode] = Field(default_factory=list)
+    lighter_robinhood_api_key_indices: Annotated[list[int], NoDecode] = Field(default_factory=list)
     lighter_robinhood_rest_url: str = "https://api.rh.lighter.xyz"
     lighter_robinhood_ws_url: str = "wss://api.rh.lighter.xyz/stream"
 
@@ -133,6 +135,12 @@ class Settings(BaseSettings):
     farming_stop_loss_usd: Decimal = Field(default=Decimal("0.50"), gt=0)
     farming_take_profit_usd: Decimal = Field(default=Decimal("0.10"), gt=0)
     farming_funding_cap_per_hour: Decimal = Field(default=Decimal("0.001"), gt=0)
+    farming_funding_history_min_minutes: int = Field(default=10, ge=0)
+    farming_funding_history_window_minutes: int = Field(default=60, gt=0)
+    farming_funding_forecast_discount: Decimal = Field(
+        default=Decimal("0.75"), gt=0, le=1
+    )
+    farming_max_payback_hours: Decimal = Field(default=Decimal("4"), gt=0)
     farming_reentry_cooldown_sec: int = Field(default=1800, ge=0)
     farming_history_min_combo_trades: int = Field(default=2, ge=1)
     farming_history_min_route_trades: int = Field(default=4, ge=1)
@@ -187,6 +195,26 @@ class Settings(BaseSettings):
         if isinstance(value, (list, tuple)):
             return [str(item).strip() for item in value if str(item).strip()]
         raise ValueError("Expected a comma-separated string or a list")
+
+    @field_validator(
+        "lighter_robinhood_account_indices",
+        "lighter_robinhood_api_key_indices",
+        mode="before",
+    )
+    @classmethod
+    def parse_lighter_indices(cls, value: object, info: ValidationInfo) -> list[int]:
+        if value is None or value == "":
+            return []
+        if isinstance(value, str):
+            indices = [int(item.strip()) for item in value.split(",") if item.strip()]
+        elif isinstance(value, (list, tuple)):
+            indices = [int(item) for item in value]
+        else:
+            raise ValueError("Expected comma-separated Lighter account and API-key indices")
+        maximum = 255 if info.field_name == "lighter_robinhood_api_key_indices" else (1 << 63) - 1
+        if any(index < 0 or index > maximum for index in indices):
+            raise ValueError("Lighter account or API-key index is out of range")
+        return indices
 
     @field_validator("farming_instance_venues", mode="before")
     @classmethod
@@ -405,6 +433,8 @@ class Settings(BaseSettings):
         "farming_stop_loss_usd",
         "farming_take_profit_usd",
         "farming_funding_cap_per_hour",
+        "farming_funding_forecast_discount",
+        "farming_max_payback_hours",
         "farming_history_tail_loss_return",
         mode="before",
     )

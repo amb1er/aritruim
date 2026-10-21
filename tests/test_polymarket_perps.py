@@ -1,7 +1,7 @@
 import re
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from aioresponses import aioresponses
@@ -155,6 +155,17 @@ async def test_live_ioc_order_uses_confirmed_fill(adapter):
             status="filled",
         )
     )
+    adapter._perps_session.fetch_orders.return_value = [
+        adapter._perps_session.place_order.return_value.order
+    ]
+    adapter._perps_session.list_fills = Mock()
+    fill_page = SimpleNamespace(items=[SimpleNamespace(
+        order_id=123, quantity=Decimal("0.001"), price=Decimal("64990"),
+        total_fee=Decimal("0.02"),
+    )])
+    adapter._perps_session.list_fills.return_value.first_page = AsyncMock(
+        return_value=fill_page
+    )
     with patch.object(adapter, "get_mark_price", new=AsyncMock(return_value=Decimal("65000"))):
         result = await adapter.place_order(
             OrderRequest(
@@ -169,6 +180,8 @@ async def test_live_ioc_order_uses_confirmed_fill(adapter):
     assert result.success is True
     assert result.order_id == "123"
     assert result.filled_size == Decimal("0.001")
+    assert result.avg_price == Decimal("64990")
+    assert result.fee_paid == Decimal("0.02")
     adapter._perps_session.place_order.assert_awaited_once_with(
         instrument_id=6,
         side="BUY",
@@ -177,4 +190,24 @@ async def test_live_ioc_order_uses_confirmed_fill(adapter):
         reduce_only=False,
         client_order_id="a" * 32,
     )
+    adapter._perps_session = None
+
+
+@pytest.mark.asyncio
+async def test_live_ioc_without_fill_receipt_is_uncertain(adapter):
+    adapter._perps_session = AsyncMock()
+    placed = SimpleNamespace(id=123, filled_quantity=Decimal("0.001"), status="filled")
+    adapter._perps_session.place_order.return_value = SimpleNamespace(order=placed)
+    adapter._perps_session.fetch_orders.return_value = [placed]
+    adapter._perps_session.list_fills = Mock()
+    adapter._perps_session.list_fills.return_value.first_page = AsyncMock(
+        return_value=SimpleNamespace(items=[])
+    )
+    with patch.object(adapter, "get_mark_price", new=AsyncMock(return_value=Decimal("65000"))):
+        result = await adapter.place_order(OrderRequest(
+            exchange=adapter.name, symbol="BTC", side=OrderSide.LONG,
+            notional_usd=Decimal("65"), leverage=Decimal("1"),
+        ))
+    assert result.success is False
+    assert result.uncertain is True
     adapter._perps_session = None

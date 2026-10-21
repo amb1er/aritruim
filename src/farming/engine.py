@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from decimal import Decimal
+from itertools import permutations
 
 import aiosqlite
 import structlog
@@ -15,10 +16,11 @@ import structlog
 from src.farming.live_executor import LiveFarmingExecutor
 from src.farming.optimizer import FarmingOptimizer, FarmingRoute, VenueQuote
 from src.farming.performance import PerformanceDecision, PerformanceGuard
-from src.models import BotMode, FundingRate, utc_now
+from src.models import BotMode, FundingRate, OrderSide, as_utc, utc_now
 
 log = structlog.get_logger(__name__)
 D = Decimal
+PNL_MODEL_VERSION = 2
 
 
 @dataclass
@@ -35,6 +37,9 @@ class PaperPosition:
     opened_at: datetime
     expected_cash_pnl: Decimal
     mode: str = "paper"
+    accrued_funding: Decimal = D("0")
+    funding_updated_at: datetime | None = None
+    pnl_model_version: int = PNL_MODEL_VERSION
 
 
 class FarmingEngine:
@@ -47,6 +52,10 @@ class FarmingEngine:
         self.positions: dict[str, PaperPosition] = {}
         self.confirmations: dict[tuple[str, str, str], int] = {}
         self.cooldowns: dict[tuple[str, str, str], datetime] = {}
+        self._funding_history: dict[
+            tuple[str, str, str], list[tuple[datetime, Decimal]]
+        ] = {}
+        self._reversal_confirmations: dict[str, int] = {}
         self._history_decision_logged_at: dict[tuple[str, str, str], datetime] = {}
         self.is_live = settings.farming_mode == BotMode.LIVE
         self.live_executor: LiveFarmingExecutor | None = None
@@ -84,7 +93,11 @@ class FarmingEngine:
           long_entry TEXT NOT NULL, short_entry TEXT NOT NULL, entry_fees TEXT NOT NULL,
           opened_at TEXT NOT NULL, expected_cash_pnl TEXT NOT NULL,
           closed_at TEXT, close_reason TEXT, net_pnl TEXT,
-          mode TEXT NOT NULL DEFAULT 'paper'
+          mode TEXT NOT NULL DEFAULT 'paper',
+          pnl_complete INTEGER NOT NULL DEFAULT 1,
+          accrued_funding TEXT NOT NULL DEFAULT '0',
+          funding_updated_at TEXT,
+          pnl_model_version INTEGER NOT NULL DEFAULT 1
         );
         CREATE TABLE IF NOT EXISTS farming_scans (
           timestamp TEXT NOT NULL, candidates INTEGER NOT NULL, viable INTEGER NOT NULL,
@@ -95,7 +108,8 @@ class FarmingEngine:
           venue TEXT NOT NULL, symbol TEXT NOT NULL, side TEXT NOT NULL,
           requested_quantity TEXT NOT NULL, order_id TEXT NOT NULL,
           filled_quantity TEXT NOT NULL, avg_price TEXT NOT NULL, fee_paid TEXT NOT NULL,
-          success INTEGER NOT NULL, error TEXT NOT NULL
+          success INTEGER NOT NULL, error TEXT NOT NULL,
+          uncertain INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS farming_entry_features (
           position_id TEXT PRIMARY KEY, timestamp TEXT NOT NULL, symbol TEXT NOT NULL,
@@ -120,10 +134,44 @@ class FarmingEngine:
                 "ALTER TABLE farming_positions "
                 "ADD COLUMN mode TEXT NOT NULL DEFAULT 'paper'"
             )
+        if "pnl_complete" not in columns:
+            await self.db.execute(
+                "ALTER TABLE farming_positions "
+                "ADD COLUMN pnl_complete INTEGER NOT NULL DEFAULT 1"
+            )
+            await self.db.execute(
+                "UPDATE farming_positions SET pnl_complete=0 WHERE mode='live'"
+            )
+        if "accrued_funding" not in columns:
+            await self.db.execute(
+                "ALTER TABLE farming_positions "
+                "ADD COLUMN accrued_funding TEXT NOT NULL DEFAULT '0'"
+            )
+        if "funding_updated_at" not in columns:
+            await self.db.execute(
+                "ALTER TABLE farming_positions ADD COLUMN funding_updated_at TEXT"
+            )
+        if "pnl_model_version" not in columns:
+            await self.db.execute(
+                "ALTER TABLE farming_positions "
+                "ADD COLUMN pnl_model_version INTEGER NOT NULL DEFAULT 1"
+            )
+        order_columns = {
+            row[1] for row in await (await self.db.execute(
+                "PRAGMA table_info(farming_live_orders)"
+            )).fetchall()
+        }
+        if "uncertain" not in order_columns:
+            await self.db.execute(
+                "ALTER TABLE farming_live_orders "
+                "ADD COLUMN uncertain INTEGER NOT NULL DEFAULT 0"
+            )
         await self.db.commit()
         history = await self.db.execute(
             "SELECT symbol,long_venue,short_venue,notional_usd,net_pnl,closed_at "
-            "FROM farming_positions WHERE closed_at IS NOT NULL AND net_pnl IS NOT NULL"
+            "FROM farming_positions WHERE closed_at IS NOT NULL AND net_pnl IS NOT NULL "
+            "AND pnl_complete=1 AND pnl_model_version>=?",
+            (PNL_MODEL_VERSION,),
         )
         for symbol, long_venue, short_venue, notional, net, closed_at in await history.fetchall():
             self.performance.add_trade(
@@ -132,7 +180,8 @@ class FarmingEngine:
             )
         cursor = await self.db.execute(
             "SELECT id,symbol,long_venue,short_venue,quantity,notional_usd,long_entry,"
-            "short_entry,entry_fees,opened_at,expected_cash_pnl,mode FROM farming_positions "
+            "short_entry,entry_fees,opened_at,expected_cash_pnl,mode,accrued_funding,"
+            "funding_updated_at,pnl_model_version FROM farming_positions "
             "WHERE closed_at IS NULL"
         )
         for row in await cursor.fetchall():
@@ -162,17 +211,20 @@ class FarmingEngine:
                 datetime.fromisoformat(row[9]),
                 D(row[10]),
                 row[11],
+                D(row[12]),
+                utc_now(),
+                int(row[14]),
             )
             self.positions[p.id] = p
         if self.is_live:
-            if self.positions:
+            if any(p.mode != "live" for p in self.positions.values()):
                 raise RuntimeError(
-                    "Live database contains open positions; reconcile them before restart"
+                    "Live database contains non-live open positions; reconcile manually"
                 )
             self.live_executor = LiveFarmingExecutor(
                 self.adapters, self.settings, self.db, self.instance_index
             )
-            await self.live_executor.preflight()
+            await self.live_executor.preflight(list(self.positions.values()))
 
     async def disconnect(self) -> None:
         if self.db:
@@ -194,6 +246,14 @@ class FarmingEngine:
                 self._log.warning("farming.venue_rates_failed", venue=name, error=str(result))
                 continue
             for rate in result:
+                age = (utc_now() - as_utc(rate.timestamp)).total_seconds()
+                if (
+                    rate.interval_hours <= 0
+                    or not rate.rate.is_finite()
+                    or age < -5
+                    or age > self.settings.max_funding_age_sec
+                ):
+                    continue
                 by_symbol.setdefault(rate.symbol, {})[name] = rate
         return by_symbol
 
@@ -207,6 +267,99 @@ class FarmingEngine:
         cap = self.settings.farming_funding_cap_per_hour
         return max(-cap, min(cap, value))
 
+    def _observe_funding_spreads(
+        self, rates: dict[str, dict[str, FundingRate]], now: datetime
+    ) -> None:
+        window_seconds = self.settings.farming_funding_history_window_minutes * 60
+        for symbol, venues in rates.items():
+            for (long_venue, long_rate), (short_venue, short_rate) in permutations(
+                venues.items(), 2
+            ):
+                spread = self._forecast_rate(short_rate) - self._forecast_rate(long_rate)
+                key = (symbol, long_venue, short_venue)
+                samples = self._funding_history.setdefault(key, [])
+                samples.append((now, spread))
+                self._funding_history[key] = [
+                    sample
+                    for sample in samples
+                    if (now - sample[0]).total_seconds() <= window_seconds
+                ]
+
+    def _conservative_funding_spread(
+        self, symbol: str, long_venue: str, short_venue: str
+    ) -> Decimal | None:
+        samples = self._funding_history.get((symbol, long_venue, short_venue), [])
+        if not samples:
+            return None
+        required_seconds = self.settings.farming_funding_history_min_minutes * 60
+        observed_seconds = (samples[-1][0] - samples[0][0]).total_seconds()
+        values = [value for _, value in samples]
+        if observed_seconds < required_seconds or any(value <= 0 for value in values):
+            return None
+        ordered = sorted(values)
+        low_quartile = ordered[(len(ordered) - 1) // 4]
+        return min(values[-1], low_quartile) * self.settings.farming_funding_forecast_discount
+
+    def _apply_funding_forecast(self, routes: list[FarmingRoute]) -> list[FarmingRoute]:
+        forecasted: list[FarmingRoute] = []
+        hold_hours = min(
+            self.settings.farming_expected_hold_hours,
+            self.settings.farming_max_hold_hours,
+        )
+        for route in routes:
+            spread = self._conservative_funding_spread(
+                route.symbol, route.long_venue, route.short_venue
+            )
+            if spread is None:
+                continue
+            funding_per_hour = route.notional_usd * spread
+            required_cash = (
+                route.round_trip_cost_usd
+                + route.basis_reserve_usd
+                + self.settings.farming_min_expected_cash_pnl_usd
+            )
+            if (
+                funding_per_hour <= 0
+                or required_cash / funding_per_hour > self.settings.farming_max_payback_hours
+            ):
+                continue
+            expected_funding = funding_per_hour * hold_hours
+            cash_pnl = (
+                expected_funding - route.round_trip_cost_usd - route.basis_reserve_usd
+            )
+            if cash_pnl < self.settings.farming_min_expected_cash_pnl_usd:
+                continue
+            forecasted.append(
+                replace(
+                    route,
+                    expected_funding_usd=expected_funding,
+                    expected_cash_pnl_usd=cash_pnl,
+                    objective_usd=cash_pnl + route.farming_subsidy_usd,
+                )
+            )
+        return sorted(
+            forecasted,
+            key=lambda item: (item.objective_usd, item.expected_cash_pnl_usd),
+            reverse=True,
+        )
+
+    @staticmethod
+    def _accrue_paper_funding(
+        position: PaperPosition,
+        current_spread: Decimal,
+        now: datetime,
+        rates_available: bool,
+    ) -> None:
+        if position.mode != "paper":
+            return
+        previous = position.funding_updated_at or now
+        if rates_available:
+            interval_hours = D(str(max(0, (now - previous).total_seconds()))) / D("3600")
+            position.accrued_funding += (
+                position.notional_usd * current_spread * interval_hours
+            )
+        position.funding_updated_at = now
+
     async def _quote(self, symbol: str, venue: str, rate: FundingRate) -> VenueQuote | None:
         adapter = self.adapters[venue]
         try:
@@ -214,6 +367,9 @@ class FarmingEngine:
                 adapter.get_orderbook(symbol, 20), adapter.get_fee_rate(symbol)
             )
             if not book.bids or not book.asks:
+                return None
+            age = (utc_now() - as_utc(book.timestamp)).total_seconds()
+            if age < -5 or age > self.settings.max_book_age_sec:
                 return None
             bid_depth = sum(x.price * x.size for x in book.bids)
             ask_depth = sum(x.price * x.size for x in book.asks)
@@ -223,8 +379,12 @@ class FarmingEngine:
             self._log.info("farming.quote_failed", venue=venue, symbol=symbol, error=str(exc))
             return None
 
-    async def scan(self) -> list[FarmingRoute]:
-        rates = await self._rates()
+    async def scan(
+        self, rates: dict[str, dict[str, FundingRate]] | None = None
+    ) -> list[FarmingRoute]:
+        rates = rates if rates is not None else await self._rates()
+        now = utc_now()
+        self._observe_funding_spreads(rates, now)
         raw = []
         for symbol, venues in rates.items():
             if len(venues) < 2:
@@ -236,7 +396,11 @@ class FarmingEngine:
         tasks = [self._quote(symbol, venue, rate) for _, symbol, venues in raw[:20]
                  for venue, rate in venues.items()]
         quotes = [x for x in await asyncio.gather(*tasks) if x is not None]
-        routes = self.optimizer.rank(quotes)
+        routes = self._apply_funding_forecast(self.optimizer.rank(quotes))
+        viable_keys = {(r.symbol, r.long_venue, r.short_venue) for r in routes}
+        self.confirmations = {
+            key: count for key, count in self.confirmations.items() if key in viable_keys
+        }
         assert self.db is not None
         best = asdict(routes[0]) if routes else None
         await self.db.execute(
@@ -287,13 +451,63 @@ class FarmingEngine:
         )
         long_px = long_book.execution_price("long", route.quantity)
         short_px = short_book.execution_price("short", route.quantity)
-        if long_px is None or short_px is None:
+        long_exit = long_book.execution_price(OrderSide.SHORT, route.quantity)
+        short_exit = short_book.execution_price(OrderSide.LONG, route.quantity)
+        book_ages = (
+            (now - as_utc(long_book.timestamp)).total_seconds(),
+            (now - as_utc(short_book.timestamp)).total_seconds(),
+        )
+        if (
+            long_px is None
+            or short_px is None
+            or long_exit is None
+            or short_exit is None
+            or any(age < -5 or age > self.settings.max_book_age_sec for age in book_ages)
+        ):
             return
         long_fee, short_fee = await asyncio.gather(
             self.adapters[route.long_venue].get_fee_rate(route.symbol),
             self.adapters[route.short_venue].get_fee_rate(route.symbol),
         )
         entry_fees = route.quantity * (long_px * long_fee.taker + short_px * short_fee.taker)
+        exit_fees = route.quantity * (
+            long_exit * long_fee.taker + short_exit * short_fee.taker
+        )
+        round_trip_cost = route.quantity * (
+            (long_px - long_exit) + (short_exit - short_px)
+        ) + entry_fees + exit_fees
+        revalidated_cash_pnl = (
+            route.expected_funding_usd - round_trip_cost - route.basis_reserve_usd
+        )
+        hold_hours = min(
+            self.settings.farming_expected_hold_hours,
+            self.settings.farming_max_hold_hours,
+        )
+        funding_per_hour = route.expected_funding_usd / hold_hours
+        required_cash = (
+            round_trip_cost
+            + route.basis_reserve_usd
+            + self.settings.farming_min_expected_cash_pnl_usd
+        )
+        if (
+            revalidated_cash_pnl < self.settings.farming_min_expected_cash_pnl_usd
+            or funding_per_hour <= 0
+            or required_cash / funding_per_hour > self.settings.farming_max_payback_hours
+        ):
+            self._log.info(
+                "farming.skip_entry_revalidation",
+                symbol=route.symbol,
+                long=route.long_venue,
+                short=route.short_venue,
+                expected_cash_pnl=str(revalidated_cash_pnl),
+            )
+            return
+        route = replace(
+            route,
+            round_trip_cost_usd=round_trip_cost,
+            expected_cash_pnl_usd=revalidated_cash_pnl,
+            objective_usd=revalidated_cash_pnl + route.farming_subsidy_usd,
+        )
         position_id = uuid.uuid4().hex
         mode = "paper"
         if self.live_executor is not None:
@@ -314,21 +528,27 @@ class FarmingEngine:
             route.long_venue,
             route.short_venue,
             quantity,
-            route.notional_usd,
+            (quantity * (long_px + short_px) / D("2")
+             if mode == "live" else route.notional_usd),
             long_px,
             short_px,
             entry_fees,
             now,
             route.expected_cash_pnl_usd,
             mode,
+            D("0"),
+            now,
+            PNL_MODEL_VERSION,
         )
         self.positions[p.id] = p
+        self.confirmations.pop(key, None)
         assert self.db is not None
         await self.db.execute(
             "INSERT INTO farming_positions "
             "(id,symbol,long_venue,short_venue,quantity,notional_usd,long_entry,"
             "short_entry,entry_fees,opened_at,expected_cash_pnl,closed_at,close_reason,"
-            "net_pnl,mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?)",
+            "net_pnl,mode,pnl_complete,accrued_funding,funding_updated_at,pnl_model_version) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL,?,?,?,?,?)",
             (
                 p.id,
                 p.symbol,
@@ -342,6 +562,10 @@ class FarmingEngine:
                 p.opened_at.isoformat(),
                 str(p.expected_cash_pnl),
                 p.mode,
+                int(p.mode == "paper"),
+                str(p.accrued_funding),
+                p.funding_updated_at.isoformat() if p.funding_updated_at else None,
+                p.pnl_model_version,
             ),
         )
         await self.db.execute(
@@ -394,6 +618,7 @@ class FarmingEngine:
     async def _monitor(self, rates: dict[str, dict[str, FundingRate]]) -> None:
         for p in list(self.positions.values()):
             try:
+                now = utc_now()
                 lb, sb, lf, sf = await asyncio.gather(
                     self.adapters[p.long_venue].get_orderbook(p.symbol, 20),
                     self.adapters[p.short_venue].get_orderbook(p.symbol, 20),
@@ -404,17 +629,23 @@ class FarmingEngine:
                 short_exit = sb.execution_price("long", p.quantity)
                 if long_exit is None or short_exit is None:
                     continue
-                hours = D(str((utc_now() - p.opened_at).total_seconds())) / D("3600")
+                hours = D(str((now - p.opened_at).total_seconds())) / D("3600")
                 rr = rates.get(p.symbol, {})
                 lr, sr = rr.get(p.long_venue), rr.get(p.short_venue)
-                carry = D("0")
                 current_spread = D("0")
                 if lr and sr:
-                    current_spread = self._per_hour(sr) - self._per_hour(lr)
-                    carry = p.notional_usd * current_spread * hours
+                    current_spread = self._forecast_rate(sr) - self._forecast_rate(lr)
+                self._accrue_paper_funding(p, current_spread, now, bool(lr and sr))
+                if p.mode == "paper":
+                    assert self.db is not None
+                    await self.db.execute(
+                        "UPDATE farming_positions SET accrued_funding=?,"
+                        "funding_updated_at=? WHERE id=?",
+                        (str(p.accrued_funding), now.isoformat(), p.id),
+                    )
                 price_pnl = p.quantity * ((long_exit - p.long_entry) + (p.short_entry - short_exit))
                 exit_fees = p.quantity * (long_exit * lf.taker + short_exit * sf.taker)
-                net = price_pnl + carry - p.entry_fees - exit_fees
+                net = price_pnl + p.accrued_funding - p.entry_fees - exit_fees
                 reason = None
                 if net >= self.settings.farming_take_profit_usd:
                     reason = "take_profit"
@@ -422,18 +653,37 @@ class FarmingEngine:
                     reason = "stop_loss"
                 elif hours >= self.settings.farming_max_hold_hours:
                     reason = "max_hold"
-                elif current_spread <= 0 and hours >= D("1"):
+                if lr and sr and current_spread <= 0:
+                    self._reversal_confirmations[p.id] = (
+                        self._reversal_confirmations.get(p.id, 0) + 1
+                    )
+                else:
+                    self._reversal_confirmations[p.id] = 0
+                reversal_scans = max(
+                    3,
+                    self.settings.farming_funding_history_min_minutes
+                    * 60
+                    // self.settings.farming_scan_interval_sec,
+                )
+                if (
+                    reason is None
+                    and hours >= D("1")
+                    and self._reversal_confirmations[p.id] >= reversal_scans
+                ):
                     reason = "funding_reversed"
                 if reason:
                     await self._close(p, net, reason)
                 else:
                     self._log.info(
-                        "farming.paper_mark",
+                        f"farming.{p.mode}_mark",
                         symbol=p.symbol,
                         net_pnl=str(net),
                         elapsed_hours=str(hours.quantize(D("0.001"))),
                         funding_spread_hourly=str(current_spread),
+                        accrued_funding=str(p.accrued_funding),
                     )
+                if self.db is not None:
+                    await self.db.commit()
             except Exception as exc:
                 self._log.warning("farming.monitor_failed", symbol=p.symbol, error=str(exc))
 
@@ -445,33 +695,36 @@ class FarmingEngine:
             close = await self.live_executor.close(p, reason)
             if close is None:
                 return
-            hours = D(str((utc_now() - p.opened_at).total_seconds())) / D("3600")
             price_pnl = p.quantity * (
                 (close.long_exit - p.long_entry) + (p.short_entry - close.short_exit)
             )
             net = price_pnl - p.entry_fees - close.fees
-            rr = await self._rates()
-            lr = rr.get(p.symbol, {}).get(p.long_venue)
-            sr = rr.get(p.symbol, {}).get(p.short_venue)
-            if lr and sr:
-                net += p.notional_usd * (self._per_hour(sr) - self._per_hour(lr)) * hours
+            self._log.info(
+                "farming.live_pnl_excludes_funding",
+                symbol=p.symbol,
+                position_id=p.id,
+            )
         await self.db.execute(
-            "UPDATE farming_positions SET closed_at=?,close_reason=?,net_pnl=? WHERE id=?",
-            (utc_now().isoformat(), reason, str(net), p.id),
+            "UPDATE farming_positions SET closed_at=?,close_reason=?,net_pnl=?,"
+            "pnl_complete=? WHERE id=?",
+            (utc_now().isoformat(), reason, str(net), int(p.mode == "paper"), p.id),
         )
         await self.db.commit()
         self.positions.pop(p.id, None)
+        self._reversal_confirmations.pop(p.id, None)
         closed_at = utc_now()
         self.cooldowns[(p.symbol, p.long_venue, p.short_venue)] = closed_at
-        self.performance.add_trade(
-            p.symbol, p.long_venue, p.short_venue, p.notional_usd, net, closed_at
-        )
+        if p.mode == "paper" and p.pnl_model_version >= PNL_MODEL_VERSION:
+            self.performance.add_trade(
+                p.symbol, p.long_venue, p.short_venue, p.notional_usd, net, closed_at
+            )
         self._log.warning(
             f"farming.{p.mode}_position_closed",
             symbol=p.symbol,
             long=p.long_venue,
             short=p.short_venue,
             net_pnl=str(net),
+            pnl_complete=p.mode == "paper",
             reason=reason,
         )
 
@@ -484,7 +737,7 @@ class FarmingEngine:
                 len(self.positions) < self.settings.farming_max_open_pairs
                 and not (self.live_executor and self.live_executor.halted)
             ):
-                for route in await self.scan():
+                for route in await self.scan(rates):
                     await self._open(route)
                     if len(self.positions) >= self.settings.farming_max_open_pairs:
                         break

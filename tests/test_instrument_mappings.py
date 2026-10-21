@@ -17,6 +17,7 @@ from src.models import (
     OrderbookLevel,
     OrderRequest,
     OrderSide,
+    Position,
     utc_now,
 )
 
@@ -102,6 +103,18 @@ async def test_conversion_preserves_notional_and_funding_rate():
     assert (await normalized.get_funding_rate("PEPE")).rate == D("0.001")
     assert (await normalized.get_funding_history("PEPE"))[0].rate == D("0.001")
     assert (await normalized.get_fee_rate("PEPE")).taker == D("0.001")
+
+
+@pytest.mark.asyncio
+async def test_live_position_uses_canonical_size_and_price():
+    raw, normalized = adapter()
+    raw.get_positions = AsyncMock(return_value=[
+        Position("a", "kPEPE", OrderSide.LONG, D("2"), D("0.004"), D("0"))
+    ])
+    positions = await normalized.get_positions()
+    assert positions[0].symbol == "PEPE"
+    assert positions[0].size == D("2000")
+    assert positions[0].entry_price == D("0.000004")
 
 
 @pytest.mark.asyncio

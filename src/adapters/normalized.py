@@ -59,7 +59,7 @@ class NormalizedAdapter:
 
     @property
     def supports_live(self):
-        return getattr(self._adapter, "supports_live", True)
+        return getattr(self._adapter, "supports_live", False)
 
     def canonical_symbol(self, symbol):
         return self._mapping.get(symbol, (symbol, Decimal("1")))[0]
@@ -123,6 +123,18 @@ class NormalizedAdapter:
     async def get_fee_rate(self, symbol):
         native, _ = self._resolve(symbol)
         return replace(await self._adapter.get_fee_rate(native), symbol=symbol)
+
+    async def get_positions(self):
+        result = []
+        for position in await self._adapter.get_positions():
+            mapped = self._mapping.get(position.symbol)
+            if mapped is None or mapped[0] not in self._canonical:
+                raise ValueError(f"Unmapped live position: {self.name}/{position.symbol}")
+            asset, factor = mapped
+            result.append(replace(position, exchange=self.name, symbol=asset,
+                                  size=position.size * factor,
+                                  entry_price=position.entry_price / factor))
+        return result
 
     async def place_order(self, order):
         native, factor = self._resolve(order.symbol)

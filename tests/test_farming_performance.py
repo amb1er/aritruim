@@ -57,3 +57,24 @@ def test_single_tail_loss_gets_cooldown_without_permanent_blacklist():
     assert not blocked.allowed
     assert blocked.reason == "recent_tail_loss"
     assert probe.allowed
+
+
+def test_high_win_rate_does_not_hide_negative_route_expectancy():
+    history = guard()
+    now = utc_now()
+    for index in range(7):
+        history.add_trade(
+            f"WIN{index}", "txflow", "nado", Decimal("100"), Decimal("0.10"), now
+        )
+    for index in range(3):
+        history.add_trade(
+            f"LOSS{index}", "txflow", "nado", Decimal("100"), Decimal("-0.40"), now
+        )
+
+    decision = history.decide("NEW", "txflow", "nado", now)
+
+    assert decision.route.win_rate == Decimal("0.7")
+    assert decision.route.profit_factor < 1
+    assert decision.route.average_return < 0
+    assert not decision.allowed
+    assert decision.reason == "negative_route_expectancy"

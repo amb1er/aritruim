@@ -53,6 +53,7 @@ _WS_PING_TIMEOUT_SEC = 20  # таймаут ожидания pong после pin
 
 
 class HyperliquidAdapter(ExchangeAdapter):
+    supports_live = True
     funding_model = "hourly_history"
     def __init__(
         self,
@@ -402,9 +403,11 @@ class HyperliquidAdapter(ExchangeAdapter):
                 )
             result = await asyncio.wait_for(pending, timeout=_ORDER_TIMEOUT_SEC)
         except TimeoutError:
-            return self._error_result(order, f"Order timeout after {_ORDER_TIMEOUT_SEC}s")
+            return self._error_result(
+                order, f"Order timeout after {_ORDER_TIMEOUT_SEC}s", uncertain=True
+            )
         except Exception as e:
-            return self._error_result(order, str(e))
+            return self._error_result(order, str(e), uncertain=True)
 
         return self._parse_sdk_result(order, result)
 
@@ -578,7 +581,7 @@ class HyperliquidAdapter(ExchangeAdapter):
         )
 
     @staticmethod
-    def _error_result(order: OrderRequest, error: str) -> OrderResult:
+    def _error_result(order: OrderRequest, error: str, *, uncertain: bool = False) -> OrderResult:
         return OrderResult(
             exchange=order.exchange,
             symbol=order.symbol,
@@ -589,7 +592,7 @@ class HyperliquidAdapter(ExchangeAdapter):
             fee_paid=Decimal("0"),
             success=False,
             error=error,
-            uncertain=any(
+            uncertain=uncertain or any(
                 w in error.lower() for w in ("timeout", "connection", "unknown", "resting")
             ),
         )

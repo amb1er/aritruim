@@ -1,4 +1,4 @@
-"""Standalone entrypoint for the multi-venue paper farming strategy."""
+"""Standalone entrypoint for the multi-venue farming strategy."""
 
 import asyncio
 import logging
@@ -61,6 +61,7 @@ class FarmingInstanceContext:
         if arcus_adapter is not None:
             owned_adapters.append(arcus_adapter)
         connected = []
+        engine = None
         try:
             for adapter in owned_adapters:
                 await adapter.connect()
@@ -77,6 +78,8 @@ class FarmingInstanceContext:
             )
             await engine.connect()
         except Exception:
+            if engine is not None:
+                await engine.disconnect()
             for adapter in reversed(connected):
                 await adapter.disconnect()
             raise
@@ -153,13 +156,37 @@ async def run() -> None:
     txflow_accounts = settings.resolved_txflow_accounts()
     lighter_accounts = settings.resolved_lighter_robinhood_accounts()
     arcus_accounts = settings.resolved_arcus_accounts()
+    live_venues = set()
+    if any(account.address and account.credential for account in nado_accounts):
+        live_venues.add("nado")
+    if settings.entropy_enabled and any(
+        account.address and account.credential for account in entropy_accounts
+    ):
+        live_venues.add("entropy")
+    if settings.polymarket_perps_enabled and any(
+        account.address and account.credential for account in polymarket_accounts
+    ):
+        live_venues.add("polymarket_perps")
+    if (
+        settings.lighter_robinhood_enabled
+        and lighter_accounts
+        and len(settings.lighter_robinhood_account_indices) >= len(lighter_accounts)
+        and len(settings.lighter_robinhood_api_key_indices) >= len(lighter_accounts)
+        and any(account.address and account.credential for account in lighter_accounts)
+    ):
+        live_venues.add("lighter_robinhood")
     if settings.farming_instance_venues:
         account_counts = {"venue_profile_count": len(settings.farming_instance_venues)}
     elif settings.farming_mode == BotMode.LIVE:
-        account_counts = {
-            "entropy_count": len(entropy_accounts),
-            "polymarket_perps_count": len(polymarket_accounts),
-        }
+        account_counts = {}
+        if "entropy" in live_venues:
+            account_counts["entropy_count"] = len(entropy_accounts)
+        if "nado" in live_venues:
+            account_counts["nado_count"] = len(nado_accounts)
+        if "polymarket_perps" in live_venues:
+            account_counts["polymarket_perps_count"] = len(polymarket_accounts)
+        if "lighter_robinhood" in live_venues:
+            account_counts["lighter_robinhood_count"] = len(lighter_accounts)
     else:
         primary_count = min(len(entropy_accounts), len(nado_accounts))
         account_counts = {
@@ -172,7 +199,7 @@ async def run() -> None:
             account_counts["lighter_robinhood_count"] = len(lighter_accounts) or primary_count
         if settings.arcus_enabled:
             account_counts["arcus_count"] = len(arcus_accounts) or primary_count
-    effective_count = min(account_counts.values())
+    effective_count = min(account_counts.values(), default=0)
     log = structlog.get_logger(__name__)
     if len(set(account_counts.values())) != 1 and effective_count > 0:
         log.warning("wallet_count_mismatch", **account_counts, effective_count=effective_count)
@@ -186,7 +213,16 @@ async def run() -> None:
         for index in range(effective_count):
             monitored = settings.farming_venues_for_instance(index)
             if settings.farming_mode == BotMode.LIVE:
-                monitored &= {"entropy", "polymarket_perps"}
+                unsupported = monitored - live_venues
+                if unsupported:
+                    log.warning(
+                        "farming.live_unsupported_venues",
+                        instance_index=index,
+                        venues=sorted(unsupported),
+                    )
+                    if settings.farming_instance_venues:
+                        continue
+                monitored &= live_venues
             if not settings.entropy_enabled:
                 monitored.discard("entropy")
             if not settings.polymarket_perps_enabled:
@@ -219,7 +255,14 @@ async def run() -> None:
                     venue in {"entropy", "nado"}
                     or bool(account_lists[venue])
                 )
-                and index >= len(account_lists[venue])
+                and (
+                    index >= len(account_lists[venue])
+                    or (
+                        settings.farming_mode == BotMode.LIVE
+                        and (not account_lists[venue][index].address
+                             or not account_lists[venue][index].credential)
+                    )
+                )
             ]
             if missing_accounts:
                 log.error(

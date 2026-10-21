@@ -1,4 +1,4 @@
-"""Public market-data adapter for Polymarket Perps."""
+"""Polymarket Perps market data and optional authenticated trading."""
 
 from __future__ import annotations
 
@@ -343,9 +343,41 @@ class PolymarketPerpsAdapter(ExchangeAdapter):
                 client_order_id=order.client_id or None,
             )
             placed = placement.order
+            for attempt in range(3):
+                found = await self._perps_session.fetch_orders(order_id=int(placed.id))
+                if found:
+                    placed = found[0]
+                if placed.status not in {"accepted", "open", "partial"}:
+                    break
+                if attempt < 2:
+                    await asyncio.sleep(0.25)
             filled = Decimal(placed.filled_quantity)
-            avg_price = Decimal(placed.price) if filled > 0 else Decimal("0")
-            fee = await self.get_fee_rate(order.symbol)
+            if filled > 0:
+                for attempt in range(3):
+                    page = await self._perps_session.list_fills(
+                        start=utc_now() - timedelta(minutes=5)
+                    ).first_page()
+                    fills = [item for item in page.items if int(item.order_id) == int(placed.id)]
+                    confirmed = sum((Decimal(item.quantity) for item in fills), Decimal("0"))
+                    if confirmed >= filled:
+                        break
+                    if attempt < 2:
+                        await asyncio.sleep(0.25)
+                if confirmed != filled or not fills:
+                    return self._order_error(
+                        order, "Perps fill details unavailable", uncertain=True
+                    )
+                avg_price = sum(
+                    (Decimal(item.price) * Decimal(item.quantity) for item in fills),
+                    Decimal("0"),
+                ) / filled
+                fee_paid = sum((Decimal(item.total_fee) for item in fills), Decimal("0"))
+            else:
+                avg_price = Decimal("0")
+                fee_paid = Decimal("0")
+            terminal = placed.status not in {"accepted", "open", "partial"}
+            if not terminal:
+                return self._order_error(order, "Perps IOC status is not final", uncertain=True)
             success = filled > 0
             return OrderResult(
                 exchange=self.name,
@@ -354,7 +386,7 @@ class PolymarketPerpsAdapter(ExchangeAdapter):
                 side=order.side,
                 filled_size=filled,
                 avg_price=avg_price,
-                fee_paid=filled * avg_price * fee.taker,
+                fee_paid=fee_paid,
                 success=success,
                 error="" if success else f"Polymarket order status: {placed.status}",
             )

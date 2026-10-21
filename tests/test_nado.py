@@ -1,12 +1,16 @@
 """Contract-shaped Nado HTTP fixtures; no fabricated execution responses."""
 
 from decimal import Decimal
+from unittest.mock import AsyncMock
 
 import pytest
 from aioresponses import aioresponses
+from eth_account import Account
+from eth_account.messages import encode_typed_data
 
 from src.adapters.nado import NadoAdapter
 from src.config import Settings
+from src.models import BotMode, Orderbook, OrderbookLevel, OrderRequest, OrderSide
 
 PRODUCTS = [
     {
@@ -127,3 +131,122 @@ def test_instance_index_selects_credentials_and_name():
     assert adapter._wallet_address == "wallet-2"
     assert adapter._private_key == "key-2"
     assert adapter._transport_url == "http://proxy-2:8080"
+
+
+@pytest.mark.asyncio
+async def test_signed_nado_ioc_reports_only_archived_fill(monkeypatch):
+    wallet = Account.create()
+    settings = Settings(
+        _env_file=None,
+        farming_mode=BotMode.LIVE,
+        nado_accounts=f"{wallet.address}:{wallet.key.hex()}:",
+        max_slippage=Decimal("0.002"),
+    )
+    adapter = NadoAdapter(settings)
+    adapter._chain_id = 763373
+    adapter._subaccount = "0x" + wallet.address[2:].lower() + b"default".hex().ljust(24, "0")
+    adapter._products = {"BTC": {
+        "product_id": 2, "size_increment": "10000000000000",
+        "price_increment_x18": "1000000000000000000",
+        "min_size": "100000000000000000000", "isolated_only": False,
+    }}
+    monkeypatch.setattr(adapter, "_load_products", AsyncMock(return_value=adapter._products))
+    monkeypatch.setattr(adapter, "_query", AsyncMock(return_value={"orders": []}))
+    monkeypatch.setattr(adapter, "get_orderbook", AsyncMock(return_value=Orderbook(
+        adapter.name, "BTC",
+        [OrderbookLevel(Decimal("49990"), Decimal("1"))],
+        [OrderbookLevel(Decimal("50000"), Decimal("1"))],
+    )))
+    digest = "0x" + "ab" * 32
+    execute = AsyncMock(return_value={"status": "success", "data": {"digest": digest}})
+    monkeypatch.setattr(adapter, "_execute", execute)
+
+    async def archive(_):
+        sent = execute.await_args.args[0]["place_order"]["order"]
+        return {"orders": [{
+            "digest": digest, "subaccount": adapter._subaccount,
+            "product_id": 2, "amount": sent["amount"], "nonce": sent["nonce"],
+            "appendix": sent["appendix"],
+            "base_filled": "2000000000000000",
+            "quote_filled": "-100000000000000000000",
+            "fee": "50000000000000000", "builder_fee": "0",
+        }]}
+
+    monkeypatch.setattr(adapter, "_archive", archive)
+    result = await adapter.place_order(OrderRequest(
+        adapter.name, "BTC", OrderSide.LONG, Decimal("100"), Decimal("1"),
+        quantity=Decimal("0.002"), client_id="nado-test",
+    ))
+    assert result.success and not result.uncertain
+    assert result.filled_size == Decimal("0.002")
+    assert result.avg_price == Decimal("50000")
+    assert result.fee_paid == Decimal("0.05")
+    submitted = execute.await_args.args[0]["place_order"]
+    assert int(submitted["order"]["appendix"]) == 513
+    message = {key: int(value) if key != "sender" else value
+               for key, value in submitted["order"].items()}
+    signed = encode_typed_data(
+        domain_data={
+            "name": "Nado", "version": "0.0.1", "chainId": 763373,
+            "verifyingContract": "0x0000000000000000000000000000000000000002",
+        },
+        message_types={"Order": [
+            {"name": "sender", "type": "bytes32"},
+            {"name": "priceX18", "type": "int128"},
+            {"name": "amount", "type": "int128"},
+            {"name": "expiration", "type": "uint64"},
+            {"name": "nonce", "type": "uint64"},
+            {"name": "appendix", "type": "uint128"},
+        ]},
+        message_data=message,
+    )
+    assert Account.recover_message(signed, signature=submitted["signature"]) == wallet.address
+
+
+@pytest.mark.asyncio
+async def test_nado_unknown_submission_result_is_uncertain(monkeypatch):
+    wallet = Account.create()
+    settings = Settings(
+        _env_file=None,
+        farming_mode=BotMode.LIVE,
+        nado_accounts=f"{wallet.address}:{wallet.key.hex()}:",
+    )
+    adapter = NadoAdapter(settings)
+    adapter._chain_id = 763373
+    adapter._subaccount = "0x" + wallet.address[2:].lower() + b"default".hex().ljust(24, "0")
+    adapter._products = {"BTC": {
+        "product_id": 2, "size_increment": "10000000000000",
+        "price_increment_x18": "1000000000000000000",
+        "min_size": "100000000000000000000", "isolated_only": False,
+    }}
+    monkeypatch.setattr(adapter, "_load_products", AsyncMock(return_value=adapter._products))
+    monkeypatch.setattr(adapter, "_query", AsyncMock(return_value={"orders": []}))
+    monkeypatch.setattr(adapter, "get_orderbook", AsyncMock(return_value=Orderbook(
+        adapter.name, "BTC",
+        [OrderbookLevel(Decimal("49990"), Decimal("1"))],
+        [OrderbookLevel(Decimal("50000"), Decimal("1"))],
+    )))
+    monkeypatch.setattr(adapter, "_execute", AsyncMock(side_effect=TimeoutError("timeout")))
+    result = await adapter.place_order(OrderRequest(
+        adapter.name, "BTC", OrderSide.LONG, Decimal("100"), Decimal("1"),
+        quantity=Decimal("0.002"), client_id="nado-timeout",
+    ))
+    assert not result.success and result.uncertain
+
+
+@pytest.mark.asyncio
+async def test_nado_live_connect_rejects_mismatched_wallet_before_network(monkeypatch):
+    wallet = Account.create()
+    other = Account.create()
+    settings = Settings(
+        _env_file=None,
+        farming_mode=BotMode.LIVE,
+        nado_accounts=f"{other.address}:{wallet.key.hex()}:",
+    )
+    adapter = NadoAdapter(settings)
+    query = AsyncMock()
+    monkeypatch.setattr(adapter, "_query", query)
+    with pytest.raises(ConnectionError, match="Could not connect"):
+        await adapter.connect()
+    query.assert_not_awaited()
+    assert adapter._session is None
